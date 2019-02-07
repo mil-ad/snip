@@ -3,7 +3,7 @@
 
 This is an _unofficial_ PyTorch implementation of the paper [SNIP: Single-shot Network Pruning based on Connection Sensitivity](https://arxiv.org/abs/1810.02340) by Namhoon Lee, Thalaiyasingam Ajanthan and Philip H. S. Torr.
 
-It doesn not cover all the experiment in the paper but it does includes the main ones:
+It doesn not cover all the experiment in the paper but it does include the main ones:
 
 * LeNet-300-100 and LeNet5-Caffe on MNIST
 * VGG-D on CIFAR-10

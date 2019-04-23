@@ -9,12 +9,11 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 from torchvision import transforms
 
 from tensorboardX import SummaryWriter
-from torchsummary import summary as model_summary
 from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
 from ignite.metrics import Accuracy, Loss
 from ignite.contrib.handlers import ProgressBar
 
-from pruners.snip import SNIP
+from snip import SNIP
 
 torch.manual_seed(42)
 torch.backends.cudnn.deterministic = True
@@ -29,54 +28,45 @@ REPEAT_WITH_DIFFERENT_SEED = 3
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-class PrunableWeights():
-    """Intended to be inherited along with a nn.Module"""
+def apply_prune_mask(net, keep_masks):
 
-    def set_pruning_mask(self, mask):
+    # Before I can zip() layers and pruning masks I need to make sure they match
+    # one-to-one by removing all the irrelevant modules:
+    prunable_layers = filter(
+        lambda layer: isinstance(layer, nn.Conv2d) or isinstance(
+            layer, nn.Linear), net.modules())
+
+    for layer, keep_mask in zip(prunable_layers, keep_masks):
+        assert (layer.weight.shape == keep_mask.shape)
+
+        def hook_factory(keep_mask):
+            """
+            The hook function can't be defined directly here because of Python's
+            late binding which would result in all hooks getting the very last
+            mask! Getting it through another function forces early binding.
+            """
+
+            def hook(grads):
+                return grads * keep_mask
+
+            return hook
+
         # mask[i] == 0 --> Prune parameter
         # mask[i] == 1 --> Keep parameter
 
         # Step 1: Set the masked weights to zero (NB the biases are ignored)
         # Step 2: Make sure their gradients remain zero
-
-        self.weight.data[mask == 0.] = 0.
-
-        def hook(grads):
-            return grads * mask
-
-        self.weight.register_hook(hook)
-
-
-class PrunableLinear(nn.Linear, PrunableWeights):
-    pass
-
-
-class PrunableConv2d(nn.Conv2d, PrunableWeights):
-    pass
-
-
-def apply_prune_mask(net, keep_masks):
-
-    # Before I can zip() layers and pruning masks I need to make sure they match
-    # one-to-one by removing all the irelevant modules:
-    prunable_layers = filter(
-        lambda layer: isinstance(layer, nn.Conv2d) or isinstance(layer, nn.Linear),
-        net.modules()
-    )
-
-    for layer, keep_mask in zip(prunable_layers, keep_masks):
-        layer.set_pruning_mask(keep_mask)
-
-    return net
+        layer.weight.data[keep_mask == 0.] = 0.
+        layer.weight.register_hook(hook_factory(keep_mask))
 
 
 class LeNet_300_100(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.fc1 = PrunableLinear(784, 300)
-        self.fc2 = PrunableLinear(300, 100)
-        self.fc3 = PrunableLinear(100, 10)
+        self.fc1 = nn.Linear(784, 300)
+        self.fc2 = nn.Linear(300, 100)
+        self.fc3 = nn.Linear(100, 10)
 
     def forward(self, x):
         x = F.relu(self.fc1(x.view(-1, 784)))
@@ -88,11 +78,11 @@ class LeNet_5(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.conv1 = PrunableConv2d(1, 6, 5, padding=2)
-        self.conv2 = PrunableConv2d(6, 16, 5)
-        self.fc3 = PrunableLinear(16*5*5, 120)
-        self.fc4 = PrunableLinear(120, 84)
-        self.fc5 = PrunableLinear(84, 10)
+        self.conv1 = nn.Conv2d(1, 6, 5, padding=2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc3 = nn.Linear(16 * 5 * 5, 120)
+        self.fc4 = nn.Linear(120, 84)
+        self.fc5 = nn.Linear(84, 10)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
@@ -100,7 +90,7 @@ class LeNet_5(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.max_pool2d(x, 2)
 
-        x = F.relu(self.fc3(x.view(-1, 16*5*5)))
+        x = F.relu(self.fc3(x.view(-1, 16 * 5 * 5)))
         x = F.relu(self.fc4(x))
         x = F.log_softmax(self.fc5(x))
 
@@ -113,13 +103,14 @@ class LeNet_5_Caffe(nn.Module):
     from the vanilla LeNet-5. Note that the first layer does NOT have padding
     and therefore intermediate shapes do not match the official LeNet-5.
     """
+
     def __init__(self):
         super().__init__()
 
-        self.conv1 = PrunableConv2d(1, 20, 5, padding=0)
-        self.conv2 = PrunableConv2d(20, 50, 5)
-        self.fc3 = PrunableLinear(50*4*4, 500)
-        self.fc4 = PrunableLinear(500, 10)
+        self.conv1 = nn.Conv2d(1, 20, 5, padding=0)
+        self.conv2 = nn.Conv2d(20, 50, 5)
+        self.fc3 = nn.Linear(50 * 4 * 4, 500)
+        self.fc4 = nn.Linear(500, 10)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
@@ -127,7 +118,7 @@ class LeNet_5_Caffe(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.max_pool2d(x, 2)
 
-        x = F.relu(self.fc3(x.view(-1, 50*4*4)))
+        x = F.relu(self.fc3(x.view(-1, 50 * 4 * 4)))
         x = F.log_softmax(self.fc4(x))
 
         return x
@@ -135,7 +126,10 @@ class LeNet_5_Caffe(nn.Module):
 
 VGG_CONFIGS = {
     # M for MaxPool, Number for channels
-    'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
+    'D': [
+        64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M',
+        512, 512, 512, 'M'
+    ],
 }
 
 
@@ -151,19 +145,20 @@ class VGG_SNIP(nn.Module):
         * Adjusted flattening to match CIFAR-10 shapes
         * Replaced dropout layers with BatchNorm
     """
+
     def __init__(self, config, num_classes=10):
         super().__init__()
 
         self.features = self.make_layers(VGG_CONFIGS[config], batch_norm=True)
 
         self.classifier = nn.Sequential(
-            PrunableLinear(512, 512),  # 512 * 7 * 7 in the original VGG
+            nn.Linear(512, 512),  # 512 * 7 * 7 in the original VGG
             nn.ReLU(True),
             nn.BatchNorm1d(512),  # instead of dropout
-            PrunableLinear(512, 512),
+            nn.Linear(512, 512),
             nn.ReLU(True),
             nn.BatchNorm1d(512),  # instead of dropout
-            PrunableLinear(512, num_classes),
+            nn.Linear(512, num_classes),
         )
 
     @staticmethod
@@ -174,9 +169,13 @@ class VGG_SNIP(nn.Module):
             if v == 'M':
                 layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
             else:
-                conv2d = PrunableConv2d(in_channels, v, kernel_size=3, padding=1)
+                conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
                 if batch_norm:
-                    layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+                    layers += [
+                        conv2d,
+                        nn.BatchNorm2d(v),
+                        nn.ReLU(inplace=True)
+                    ]
                 else:
                     layers += [conv2d, nn.ReLU(inplace=True)]
                 in_channels = v
@@ -199,10 +198,18 @@ def get_mnist_dataloaders(train_batch_size, val_batch_size):
     train_dataset = MNIST("_dataset", True, data_transform, download=True)
     test_dataset = MNIST("_dataset", False, data_transform, download=False)
 
-    train_loader = DataLoader(train_dataset, train_batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, val_batch_size, shuffle=False,
-                             num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        train_batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True)
+    test_loader = DataLoader(
+        test_dataset,
+        val_batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True)
 
     return train_loader, test_loader
 
@@ -213,31 +220,36 @@ def get_cifar10_dataloaders(train_batch_size, test_batch_size):
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
     ])
 
     test_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
     ])
 
     train_dataset = CIFAR10('_dataset', True, train_transform, download=True)
     test_dataset = CIFAR10('_dataset', False, test_transform, download=False)
 
-    train_loader = DataLoader(train_dataset, train_batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, test_batch_size, shuffle=False,
-                             num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        train_batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True)
+    test_loader = DataLoader(
+        test_dataset,
+        test_batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True)
 
     return train_loader, test_loader
 
-# def xavier_init_fn(m):
-#     if type(m) in [PrunableLinear, SnipLinear]:
-#         print('Initialising {} to Xavier'.format(m))
-#         nn.init.xavier_normal_(m.weight)
 
-
-def mnist():
+def mnist_experiment():
 
     BATCH_SIZE = 100
     LR_DECAY_INTERVAL = 25000
@@ -245,10 +257,12 @@ def mnist():
     # net = LeNet_300_100()
     # net = LeNet_5()
     net = LeNet_5_Caffe().to(device)
-    model_summary(net, input_size=(1, 28, 28))
 
-    optimiser = optim.SGD(net.parameters(), lr=INIT_LR, momentum=0.9,
-                          weight_decay=WEIGHT_DECAY_RATE)
+    optimiser = optim.SGD(
+        net.parameters(),
+        lr=INIT_LR,
+        momentum=0.9,
+        weight_decay=WEIGHT_DECAY_RATE)
     lr_scheduler = optim.lr_scheduler.StepLR(optimiser, 30000, gamma=0.1)
 
     train_loader, val_loader = get_mnist_dataloaders(BATCH_SIZE, BATCH_SIZE)
@@ -256,21 +270,23 @@ def mnist():
     return net, optimiser, lr_scheduler, train_loader, val_loader
 
 
-def cifar10():
+def cifar10_experiment():
 
     BATCH_SIZE = 128
     LR_DECAY_INTERVAL = 30000
 
     net = VGG_SNIP('D').to(device)
 
-    # FIXME: model_summary() doesn't work with DataParallel()
-    # model_summary(net, input_size=(3, 32, 32))
+    optimiser = optim.SGD(
+        net.parameters(),
+        lr=INIT_LR,
+        momentum=0.9,
+        weight_decay=WEIGHT_DECAY_RATE)
+    lr_scheduler = optim.lr_scheduler.StepLR(
+        optimiser, LR_DECAY_INTERVAL, gamma=0.1)
 
-    optimiser = optim.SGD(net.parameters(), lr=INIT_LR, momentum=0.9,
-                          weight_decay=WEIGHT_DECAY_RATE)
-    lr_scheduler = optim.lr_scheduler.StepLR(optimiser, LR_DECAY_INTERVAL, gamma=0.1)
-
-    train_loader, val_loader = get_cifar10_dataloaders(BATCH_SIZE, BATCH_SIZE)  # TODO
+    train_loader, val_loader = get_cifar10_dataloaders(BATCH_SIZE,
+                                                       BATCH_SIZE)  # TODO
 
     return net, optimiser, lr_scheduler, train_loader, val_loader
 
@@ -279,17 +295,17 @@ def train():
 
     writer = SummaryWriter()
 
-    net, optimiser, lr_scheduler, train_loader, val_loader = cifar10()
-
-    # net.apply(xavier_init_fn)  # Xavier initialisation
+    net, optimiser, lr_scheduler, train_loader, val_loader = cifar10_experiment()
 
     # Pre-training pruning using SKIP
     keep_masks = SNIP(net, 0.05, train_loader, device)  # TODO: shuffle?
-    net = apply_prune_mask(net, keep_masks)
+    apply_prune_mask(net, keep_masks)
 
     trainer = create_supervised_trainer(net, optimiser, F.nll_loss, device)
-    evaluator = create_supervised_evaluator(
-        net, {'accuracy': Accuracy(), 'nll': Loss(F.nll_loss)}, device)
+    evaluator = create_supervised_evaluator(net, {
+        'accuracy': Accuracy(),
+        'nll': Loss(F.nll_loss)
+    }, device)
 
     pbar = ProgressBar()
     pbar.attach(trainer)
@@ -301,7 +317,8 @@ def train():
         if engine.state.iteration % LOG_INTERVAL == 0:
             # pbar.log_message("Epoch[{}] Iteration[{}/{}] Loss: {:.2f}"
             #       "".format(engine.state.epoch, iter_in_epoch, len(train_loader), engine.state.output))
-            writer.add_scalar("training/loss", engine.state.output, engine.state.iteration)
+            writer.add_scalar("training/loss", engine.state.output,
+                              engine.state.iteration)
 
     @trainer.on(Events.EPOCH_COMPLETED)
     def log_epoch(engine):
@@ -315,7 +332,8 @@ def train():
         #       .format(engine.state.epoch, avg_accuracy, avg_nll))
 
         writer.add_scalar("validation/loss", avg_nll, engine.state.iteration)
-        writer.add_scalar("validation/accuracy", avg_accuracy, engine.state.iteration)
+        writer.add_scalar("validation/accuracy", avg_accuracy,
+                          engine.state.iteration)
 
     trainer.run(train_loader, EPOCHS)
 
